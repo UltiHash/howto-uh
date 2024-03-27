@@ -3,10 +3,13 @@
 import argparse
 import concurrent.futures
 import boto3
+import boto3.s3.transfer
+import botocore
 import os
 import pathlib
 import sys
 import time
+import tqdm
 
 AWS_KEY_ID="key-id"
 AWS_KEY_SECRET="secret"
@@ -26,103 +29,114 @@ def parse_args():
         action='store')
     parser.add_argument('-j', '--jobs', help='number of concurrent jobs',
         action='store', default=8, type=int)
+    parser.add_argument('--read-timeout', help='read timeout in seconds',
+        action='store', default=60, type=int)
+    parser.add_argument('--max-attempts', help='maximum number of upload attempts',
+        action='store', default=3, type=int)
+    parser.add_argument('--no-multipart', help='disable multipart upload entirely',
+        action='store_true', dest='no_multipart')
+    parser.add_argument('-q', '--quiet', help='do not show progress bar',
+        action='store_true', dest='quiet')
 
     return parser.parse_args()
 
 class uploader:
     def __init__(self, config):
         self.threads = concurrent.futures.ThreadPoolExecutor(max_workers=config.jobs)
-        self.s3 = boto3.client('s3', endpoint_url=config.url[0],
-            aws_access_key_id=AWS_KEY_ID, aws_secret_access_key=AWS_KEY_SECRET)
-        self.config = config
 
-    def upload(self, bucket, path):
-        stats = dict()
+        s3_cnf = botocore.config.Config(
+            read_timeout=config.read_timeout,
+            retries = {
+                'max_attempts': config.max_attempts,
+                'mode': 'standard'
+            })
 
-        with open(path, 'rb') as f:
-            resp = self.s3.put_object(Bucket=bucket, Key=path.name, Body=f)
-
-            headers = resp['ResponseMetadata']['HTTPHeaders']
-            stats['uploaded_bytes'] = float(headers['uh-original-size'])
-            stats['stored_bytes'] = float(headers['uh-effective-size'])
-
-        return stats
-
-    def push(self, path):
-        results = []
-        path = path.resolve()
-
-        if self.config.bucket is not None:
-            bucket_name = self.config.bucket
+        if config.no_multipart:
+            self.transfer_config = boto3.s3.transfer.TransferConfig(
+                multipart_threshold = 16 * 1024 * 1024 * 1024 * 1024)
         else:
-            bucket_name = path.name
+            self.transfer_config = boto3.s3.transfer.TransferConfig()
 
-        print(f"uploading {path} to bucket {bucket_name}")
+        self.s3 = boto3.client('s3', endpoint_url=config.url[0], config=s3_cnf,
+            aws_access_key_id=AWS_KEY_ID, aws_secret_access_key=AWS_KEY_SECRET)
+        self.progress = None
+        self.count_buffer = 0
+        self.quiet = config.quiet
 
-        self.s3.create_bucket(Bucket=bucket_name)
-        for (root, dirs, files) in os.walk(path):
-            for file in files:
-                fullpath = pathlib.Path(root) / file
+    def upload(self, path, bucket):
+        def cb(count):
+            if self.progress is not None:
+                self.progress.update(count)
+            else:
+                self.count_buffer += count
 
-                if self.config.verbose:
-                    print(fullpath)
+        self.s3.upload_file(path, Bucket=bucket, Key=path.name, Callback=cb, Config=self.transfer_config)
 
-                results += [(fullpath, self.threads.submit(self.upload, bucket_name, fullpath))]
+    def mk_bucket(self, bucket):
+        self.s3.create_bucket(Bucket=bucket)
 
-        return results
+    def push(self, bucket, path):
+        return self.threads.submit(self.upload, bucket, path)
 
-class progress_bar(object):
-    def __init__(self, start, files):
-        self.files = files
-        self.done = 0
-        self.uploaded = 0
-        self.stored = 0
-        self.start = start
+    def stop(self):
+        if self.progress is not None:
+            self.progress.close()
 
-    def update(self, uploaded, stored):
-        self.done += 1
-        self.uploaded += uploaded
-        self.stored += stored
-
-    def print(self):
-        elapsed_s = (time.monotonic_ns() - self.start) / 1000000000
-        uploaded_mb = self.uploaded / (1024 * 1024)
-        reduction = 0 if self.uploaded == 0 else (1 - self.stored / self.uploaded)
-
-        print(f"\rUploaded {uploaded_mb: .02f} MB of data @ {uploaded_mb / elapsed_s: .02f} MB/s, " +
-              f"storage reduction {100 * reduction: .02f} %    { 100 * self.done / self.files: .02f} % ",
-              end='')
+    def set_total(self, total):
+        if not self.quiet:
+            self.progress = tqdm.tqdm(unit='b', unit_scale=True, total=total)
+            self.progress.update(self.count_buffer)
+            self.count_buffer = 0
 
 
 if __name__ == "__main__":
     config = parse_args()
 
-    start_time = time.monotonic_ns()
-
     up = uploader(config)
     results = []
+    size_total = 0
+
+    start = time.monotonic()
 
     for path in config.path:
-        results += up.push(path)
+        path = path.resolve()
 
-    prg = progress_bar(start_time, len(results))
+        if config.bucket is not None:
+            bucket = config.bucket
+        else:
+            bucket = path.name
 
-    while len(results) > 0:
-        results_remain = []
+        if not config.quiet:
+            print(f"\ruploading {path} to bucket {bucket}", end="")
 
-        for f in results:
-            if f[1].done():
-                try:
-                    info = f[1].result()
-                    prg.update(info['uploaded_bytes'], info['stored_bytes'])
-                except Exception as e:
-                    print(f"Error uploading {f[0]}: {str(e)}", file=sys.stderr)
-            else:
-                results_remain += [ f ]
+        try:
+            up.mk_bucket(bucket)
+        except:
+            pass
 
-        time.sleep(0.1)
+        if path.is_file():
+            results += [(path, up.push(path, bucket))]
+            size_total += path.stat().st_size
+            continue
 
-        results = results_remain
-        prg.print()
+        for (root, dirs, files) in os.walk(path):
+            for file in files:
+                fullpath = pathlib.Path(root) / file
+                size_total += fullpath.stat().st_size
+                results += [(fullpath, up.push(fullpath, bucket))]
 
-    print()
+    up.set_total(size_total)
+
+    for job in results:
+        try:
+            job[1].result()
+        except Exception as e:
+            print(f"Error uploading {job[0]}: {str(e)}", file=sys.stderr)
+
+    end = time.monotonic()
+    seconds = end - start
+    mb = size_total / (1024 * 1024)
+
+    up.stop()
+
+    print(f"average upload speed: {mb/seconds} MB/s")
